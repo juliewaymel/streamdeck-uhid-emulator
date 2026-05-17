@@ -224,13 +224,112 @@ def handle_output(data: bytes) -> None:
     rid = data[4] if size > 0 else 0
     if rid == 0x02:
         _image_chunks_received += 1
+        assemble_image_chunk(data)
         now = time.monotonic()
-        if now - _last_log_t > 1.0:
-            print(f"    OUTPUT image chunks={_image_chunks_received} "
-                  f"(last size={size})")
+        if now - _last_log_t > 2.0:
+            print(f"    OUTPUT image chunks={_image_chunks_received}")
             _last_log_t = now
     else:
         print(f"    OUTPUT rid=0x{rid:02x} rtype={rtype} size={size}")
+
+
+# ---------- Phase 4: image OUTPUT chunk assembly ------------------------
+#
+# python-elgato-streamdeck (StreamDeckOriginalV2.set_key_image) writes the
+# image as a sequence of 1024-byte OUTPUT reports. Layout per report:
+#
+#   byte 0   : report id (0x02)
+#   byte 1   : command  (0x07 = set_key_image)
+#   byte 2   : key index (0..14)
+#   byte 3   : is_last (1 on the final chunk, 0 otherwise)
+#   bytes 4-5: this chunk's payload length (uint16 LE)
+#   bytes 6-7: page / sequence number (uint16 LE)
+#   bytes 8+ : up to 1016 bytes of JPEG payload
+#
+# We accumulate chunks per key and, on the is_last chunk, drop the assembled
+# bytes to /tmp/streamdeck-keys/key-XX.jpg. A datagram on a "subscribe"
+# socket notifies any renderer/watcher that the file changed.
+#
+# The image arrives FLIPPED both axes (KEY_FLIP=(True, True) in the lib's
+# StreamDeckOriginalV2). Consumers (the renderer) must un-flip before
+# displaying.
+
+KEY_IMG_DIR = "/tmp/streamdeck-keys"
+IMG_NOTIFY_SOCKET = "/tmp/streamdeck-img-notify.sock"
+
+_key_image_buffers: dict[int, bytearray] = {}
+_img_notify_subscribers: set[bytes] = set()  # autobind names of listeners
+_img_notify_socket: socket.socket | None = None
+
+
+def ensure_img_dir() -> None:
+    os.makedirs(KEY_IMG_DIR, exist_ok=True)
+    try:
+        os.chmod(KEY_IMG_DIR, 0o777)
+    except OSError:
+        pass
+
+
+def open_img_notify_socket() -> socket.socket:
+    """DGRAM socket where renderers can subscribe and receive change events."""
+    try:
+        os.unlink(IMG_NOTIFY_SOCKET)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.bind(IMG_NOTIFY_SOCKET)
+    os.chmod(IMG_NOTIFY_SOCKET, 0o666)
+    s.setblocking(False)
+    return s
+
+
+def broadcast_image_changed(key: int, path: str) -> None:
+    """Send a 'key N path/to.jpg' message to every subscribed listener."""
+    if _img_notify_socket is None:
+        return
+    msg = f"key {key} {path}\n".encode()
+    dead = []
+    for addr in _img_notify_subscribers:
+        try:
+            _img_notify_socket.sendto(msg, addr)
+        except OSError:
+            dead.append(addr)
+    for d in dead:
+        _img_notify_subscribers.discard(d)
+
+
+def assemble_image_chunk(data: bytes) -> None:
+    """Parse one OUTPUT 0x02 chunk and append it to the per-key buffer."""
+    if len(data) < 4 + 8:
+        return
+    # report payload starts at offset 4 in the uhid event
+    cmd      = data[4 + 1]
+    key      = data[4 + 2]
+    is_last  = data[4 + 3]
+    plen     = struct.unpack_from("<H", data, 4 + 4)[0]
+    page     = struct.unpack_from("<H", data, 4 + 6)[0]
+    if cmd != 0x07 or key >= KEY_COUNT:
+        return
+    body = data[4 + 8 : 4 + 8 + plen]
+
+    if page == 0:
+        # First chunk of a fresh image overwrites whatever was there.
+        _key_image_buffers[key] = bytearray()
+    buf = _key_image_buffers.setdefault(key, bytearray())
+    buf.extend(body)
+
+    if is_last:
+        path = os.path.join(KEY_IMG_DIR, f"key-{key:02d}.jpg")
+        with open(path, "wb") as f:
+            f.write(bytes(buf))
+        try:
+            os.chmod(path, 0o644)
+        except OSError:
+            pass
+        size = len(buf)
+        _key_image_buffers.pop(key, None)
+        print(f"    IMG key {key}: {size} bytes -> {path}")
+        broadcast_image_changed(key, path)
 
 
 # ---------- Phase 3: button input ---------------------------------------
@@ -337,6 +436,12 @@ def main() -> int:
     ctrl = open_ctrl_socket()
     print(f"[+] Ctrl socket at {CTRL_SOCKET_PATH} "
           f"(send 'press N', 'release N', 'state HEX', 'reset')")
+
+    ensure_img_dir()
+    global _img_notify_socket
+    _img_notify_socket = open_img_notify_socket()
+    print(f"[+] Image notify socket at {IMG_NOTIFY_SOCKET}; "
+          f"images saved under {KEY_IMG_DIR}/")
     print(f"[+] Check: ls /sys/bus/hid/devices/  |  python3 tests/test_enumerate.py")
     print(f"[+] Ctrl-C to destroy and exit\n")
 
@@ -348,7 +453,9 @@ def main() -> int:
 
     try:
         while not stop:
-            r, _, _ = select.select([fd, ctrl.fileno()], [], [], 1.0)
+            r, _, _ = select.select(
+                [fd, ctrl.fileno(), _img_notify_socket.fileno()], [], [], 1.0
+            )
             if ctrl.fileno() in r:
                 try:
                     data, addr = ctrl.recvfrom(4096)
@@ -360,6 +467,18 @@ def main() -> int:
                             ctrl.sendto(reply.encode(), addr)
                         except OSError:
                             pass
+                except (BlockingIOError, ConnectionResetError):
+                    pass
+            if _img_notify_socket.fileno() in r:
+                try:
+                    msg, addr = _img_notify_socket.recvfrom(4096)
+                    text = msg.decode("utf-8", "replace").strip()
+                    if text == "subscribe" and addr:
+                        _img_notify_subscribers.add(addr)
+                        _img_notify_socket.sendto(b"OK subscribed\n", addr)
+                        print(f"[img-sub] {addr!r}")
+                    elif text == "unsubscribe" and addr:
+                        _img_notify_subscribers.discard(addr)
                 except (BlockingIOError, ConnectionResetError):
                     pass
             if fd in r:
@@ -385,6 +504,15 @@ def main() -> int:
             pass
         try:
             os.unlink(CTRL_SOCKET_PATH)
+        except OSError:
+            pass
+        if _img_notify_socket is not None:
+            try:
+                _img_notify_socket.close()
+            except OSError:
+                pass
+        try:
+            os.unlink(IMG_NOTIFY_SOCKET)
         except OSError:
             pass
         try:

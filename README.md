@@ -17,8 +17,8 @@ can talk to a virtual device — no Elgato hardware required.
 | 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | ✅ done |
 | 2 | `python-elgato-streamdeck` enumerates it + reads firmware/serial | ✅ done |
 | 3 | Button reports (UHID_INPUT2) deliver key callbacks in the app | ✅ done |
-| 4 | Image writes intercepted and rendered (pygame) | todo |
-| 5 | StreamController launches against the virtual deck | todo |
+| 4 | Image OUTPUT chunks reassembled and rendered on HDMI via pygame | ✅ done |
+| 5 | Touch (`/dev/hidraw0`) → press socket → StreamController launches | todo |
 
 Validated 2026-05-17 on a Raspberry Pi 4B (1GB, Pi OS 13 Trixie):
 
@@ -90,6 +90,34 @@ kernel's `uhid` bus, not on a USB host controller, so libusb can't see them.
 `libhidapi-hidraw` (the `hid` pip package), which does enumerate uhid devices.
 `tests/test_enumerate.py` monkey-patches the new backend into `DeviceManager`'s
 transports dict at import time.
+
+### Renderer notes (Phase 4c)
+
+`renderer.py` displays the key images on the attached HDMI screen. On Pi OS
+Lite there's no X server, so SDL2's `kmsdrm` backend is the path of least
+resistance.
+
+The `pygame` wheel on PyPI bundles its own SDL2 which on aarch64 was built
+without `kmsdrm`. Use the Debian `python3-pygame` (built against system SDL2
+2.32+, which has `kmsdrm`) instead. The simplest way to make it visible from a
+venv is:
+
+```bash
+sudo apt install -y python3-pygame
+~/sdvenv/bin/pip uninstall -y pygame
+ln -sfn /usr/lib/python3/dist-packages/pygame \
+    ~/sdvenv/lib/python3.13/site-packages/pygame
+```
+
+Run with `sudo` because `/dev/dri/card*` is restricted to the `video` group;
+the systemd transient unit below works well and survives SSH disconnects:
+
+```bash
+sudo systemd-run --quiet --unit=streamdeck-renderer \
+    --setenv=SDL_VIDEODRIVER=kmsdrm \
+    /home/juliewwlr/sdvenv/bin/python -B -u /home/juliewwlr/renderer.py
+sudo journalctl -u streamdeck-renderer -f
+```
 
 ## Caveats
 
