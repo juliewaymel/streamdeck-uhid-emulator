@@ -14,11 +14,22 @@ can talk to a virtual device — no Elgato hardware required.
 
 | Phase | What | Status |
 |------:|------|--------|
-| 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | code ready, awaiting test |
-| 2 | `python-elgato-streamdeck` enumerates it (+ firmware/serial replies) | code ready, awaiting test |
+| 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | ✅ done |
+| 2 | `python-elgato-streamdeck` enumerates it + reads firmware/serial | ✅ done |
 | 3 | Button reports (touch → HID input) | todo |
 | 4 | Image writes intercepted and rendered (pygame) | todo |
 | 5 | StreamController launches against the virtual deck | todo |
+
+Validated 2026-05-17 on a Raspberry Pi 4B (1GB, Pi OS 13 Trixie):
+
+```
+Found: 1 deck
+class: StreamDeckOriginalV2     # lib treats PID 0x0080 as a V2 variant
+KEY_COUNT: 15  layout: (3, 5)  image: 72x72 JPEG
+open() OK, is_open: True, connected: True
+firmware: '1.00.000'
+serial:   'VSD-MK2-0001'
+```
 
 ## How it works
 
@@ -51,8 +62,9 @@ cat /proc/bus/input/devices | grep -i elgato
 Then run the Phase 2 enumeration test:
 
 ```bash
-pip install streamdeck
-python3 tests/test_enumerate.py
+sudo apt install -y libhidapi-hidraw0 libhidapi-libusb0
+pip install streamdeck hid
+sudo python3 tests/test_enumerate.py            # sudo until udev rule for /dev/hidraw* lands
 ```
 
 Expected output:
@@ -60,13 +72,24 @@ Expected output:
 ```
 [+] 1 deck(s) found
 --- deck 0 ---
-  type            : Stream Deck Mk.2
-  vendor:product  : 0x0fd9:0x0080
+  class           : StreamDeckOriginalV2
+  type            : Stream Deck Original
   key count       : 15
-  key layout      : (3, 5)
+  key layout      : (3, 5) (cols x rows)
+  key image       : 72x72 JPEG
   firmware        : '1.00.000'
   serial          : 'VSD-MK2-0001'
 ```
+
+### Why a custom transport?
+
+`python-elgato-streamdeck` only ships a `libusb` transport that enumerates real
+USB devices via `libusb`. `/dev/uhid` devices are virtual — they live on the
+kernel's `uhid` bus, not on a USB host controller, so libusb can't see them.
+`hid_transport.py` adds an `hidapi` backend that walks `/dev/hidraw*` via
+`libhidapi-hidraw` (the `hid` pip package), which does enumerate uhid devices.
+`tests/test_enumerate.py` monkey-patches the new backend into `DeviceManager`'s
+transports dict at import time.
 
 ## Caveats
 

@@ -22,7 +22,16 @@ def main() -> int:
         print("  pip install streamdeck")
         return 1
 
-    decks = DeviceManager().enumerate()
+    # uhid-created devices are visible via /dev/hidraw, not libusb (they
+    # are not USB devices). The library ships only a libusb backend, so we
+    # register our own hidapi backend that uses libhidapi-hidraw under the
+    # hood. See hid_transport.py at the repo root.
+    import os, sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import hid_transport
+    hid_transport.register()
+
+    decks = DeviceManager(transport="hidapi").enumerate()
     print(f"[+] {len(decks)} deck(s) found")
     if not decks:
         print("    (is uhid_streamdeck.py running? is the user in the 'input' group "
@@ -34,10 +43,13 @@ def main() -> int:
         print(f"\n--- deck {i} ---")
         try:
             deck.open()
+            print(f"  class           : {type(deck).__name__}")
             print(f"  type            : {deck.deck_type()}")
-            print(f"  vendor:product  : {deck.VENDOR_ID:#06x}:{deck.PRODUCT_ID:#06x}")
             print(f"  key count       : {deck.key_count()}")
-            print(f"  key layout      : {deck.key_layout()}")
+            print(f"  key layout      : {deck.key_layout()} (cols x rows)")
+            print(f"  key image       : "
+                  f"{deck.KEY_PIXEL_WIDTH}x{deck.KEY_PIXEL_HEIGHT} "
+                  f"{deck.KEY_IMAGE_FORMAT}")
             try:
                 print(f"  firmware        : {deck.get_firmware_version()!r}")
             except Exception as e:
