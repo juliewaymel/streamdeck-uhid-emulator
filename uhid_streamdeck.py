@@ -17,6 +17,7 @@ In another shell:
 import os
 import select
 import signal
+import socket
 import struct
 import sys
 import time
@@ -54,9 +55,20 @@ SERIAL_STRING     = b"VSD-MK2-0001"
 EVENT_SIZE = 4376
 UHID_DATA_MAX = 4096
 
+# Stream Deck MK.2 input-report layout (verified against
+# python-elgato-streamdeck's StreamDeckOriginalV2._read_control_states):
+#   device.read(4 + KEY_COUNT)  ->  4 header bytes + 15 key bytes
+# The first byte returned by hidapi is the report ID. So:
+#   wire bytes 0..3  = report id (0x01) + 3 bytes padding/header
+#   wire bytes 4..18 = 1 byte per key (0=released, 1=pressed)
+# Total 19 bytes, including the report id prefix.
+KEY_COUNT = 15
+INPUT_PAD_BYTES = 3                   # bytes between report id and key states
+INPUT_REPORT_SIZE_NOID = INPUT_PAD_BYTES + KEY_COUNT  # bytes we send via UHID_INPUT2
+
 # HID report descriptor (vendor-defined, mimics Stream Deck MK.2):
-#   - Input  0x01 : 17 bytes (1 report id + 16 bytes button bitmap)
-#   - Output 0x02 : 1024 bytes (image chunk)
+#   - Input   0x01 : report id + 3 pad + 15 key bytes (19 bytes wire)
+#   - Output  0x02 : 1024 bytes (image chunk)
 #   - Feature 0x03 : 32 bytes (control: reset / brightness)
 #   - Feature 0x05 : 32 bytes (firmware version, read)
 #   - Feature 0x06 : 32 bytes (serial number, read)
@@ -65,14 +77,18 @@ HID_DESCRIPTOR = bytes([
     0x09, 0x01,              # Usage (0x01)
     0xA1, 0x01,              # Collection (Application)
 
-    # Input report 0x01 — button states (1 bit x 128 = 16 bytes)
-    0x85, 0x01,
-    0x09, 0x01,
-    0x15, 0x00,
-    0x25, 0x01,
-    0x75, 0x01,
-    0x95, 0x80,
-    0x81, 0x02,
+    # Input report 0x01 — 3 constant padding bytes + 15 per-key state bytes
+    0x85, 0x01,              #   Report ID (1)
+    0x09, 0x01,              #   Usage
+    0x75, 0x08,              #   Report Size (8 bits)
+    0x95, INPUT_PAD_BYTES,   #   Report Count (3) -> 3 bytes padding
+    0x81, 0x03,              #   Input (Cnst,Var,Abs)
+    0x09, 0x02,              #   Usage (key states)
+    0x15, 0x00,              #   Logical Min 0
+    0x25, 0x01,              #   Logical Max 1
+    0x75, 0x08,              #   Report Size (8 bits)
+    0x95, KEY_COUNT,         #   Report Count (15) -> 15 key state bytes
+    0x81, 0x02,              #   Input (Data,Var,Abs)
 
     # Output report 0x02 — image data (1023 bytes after report id)
     0x85, 0x02,
@@ -217,6 +233,90 @@ def handle_output(data: bytes) -> None:
         print(f"    OUTPUT rid=0x{rid:02x} rtype={rtype} size={size}")
 
 
+# ---------- Phase 3: button input ---------------------------------------
+#
+# Button state lives in a 15-byte buffer (one byte per key, 0 or 1). Every
+# time it changes we send a UHID_INPUT2 event whose payload matches the
+# input report layout declared in HID_DESCRIPTOR: report id 0x01, three
+# constant padding bytes, then the 15 key bytes.
+#
+# To drive the buffer we listen on a Unix datagram socket. Test harnesses
+# (or a future pygame touchscreen layer) write line-oriented commands:
+#   press <0-14>     set key N to 1, send report
+#   release <0-14>   set key N to 0, send report
+#   state <30 hex>   replace all 15 key bytes, send report
+#   reset            clear all keys, send report
+
+CTRL_SOCKET_PATH = "/tmp/streamdeck-vctrl.sock"
+
+_key_state = bytearray(KEY_COUNT)
+
+
+def send_input_report(fd: int) -> None:
+    """Send the current _key_state as a UHID_INPUT2 event."""
+    report = bytes([0x01]) + b"\x00" * INPUT_PAD_BYTES + bytes(_key_state)
+    # uhid_input2_req: __u16 size; __u8 data[4096];
+    payload = struct.pack(f"<H{UHID_DATA_MAX}s", len(report),
+                          _pad(report, UHID_DATA_MAX))
+    write_event(fd, UHID_INPUT2, payload)
+
+
+def handle_ctrl_command(fd: int, line: str) -> str:
+    """Parse one command, mutate _key_state, send the report. Returns a reply."""
+    parts = line.strip().split()
+    if not parts:
+        return "ERR empty\n"
+    cmd = parts[0].lower()
+
+    if cmd == "press" and len(parts) == 2 and parts[1].isdigit():
+        n = int(parts[1])
+        if not 0 <= n < KEY_COUNT:
+            return f"ERR key out of range 0..{KEY_COUNT-1}\n"
+        _key_state[n] = 1
+        send_input_report(fd)
+        return f"OK press {n}\n"
+
+    if cmd == "release" and len(parts) == 2 and parts[1].isdigit():
+        n = int(parts[1])
+        if not 0 <= n < KEY_COUNT:
+            return f"ERR key out of range 0..{KEY_COUNT-1}\n"
+        _key_state[n] = 0
+        send_input_report(fd)
+        return f"OK release {n}\n"
+
+    if cmd == "state" and len(parts) == 2:
+        try:
+            new = bytes.fromhex(parts[1])
+        except ValueError:
+            return "ERR state hex invalid\n"
+        if len(new) != KEY_COUNT:
+            return f"ERR state needs {KEY_COUNT} bytes ({KEY_COUNT*2} hex)\n"
+        _key_state[:] = new
+        send_input_report(fd)
+        return f"OK state {parts[1]}\n"
+
+    if cmd == "reset":
+        for i in range(KEY_COUNT):
+            _key_state[i] = 0
+        send_input_report(fd)
+        return "OK reset\n"
+
+    return f"ERR unknown command: {parts[0]}\n"
+
+
+def open_ctrl_socket() -> socket.socket:
+    """Create a Unix SOCK_DGRAM socket at CTRL_SOCKET_PATH (overwrite if stale)."""
+    try:
+        os.unlink(CTRL_SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.bind(CTRL_SOCKET_PATH)
+    os.chmod(CTRL_SOCKET_PATH, 0o666)
+    s.setblocking(False)
+    return s
+
+
 def main() -> int:
     if not os.path.exists("/dev/uhid"):
         print("ERROR: /dev/uhid not found.", file=sys.stderr)
@@ -233,6 +333,10 @@ def main() -> int:
     write_event(fd, UHID_CREATE2, create2_payload())
     print(f"[+] UHID_CREATE2 sent — VID=0x{VID_ELGATO:04x} PID=0x{PID_STREAMDECK_MK2:04x}")
     print(f"[+] firmware='{FW_VERSION_STRING.decode()}'  serial='{SERIAL_STRING.decode()}'")
+
+    ctrl = open_ctrl_socket()
+    print(f"[+] Ctrl socket at {CTRL_SOCKET_PATH} "
+          f"(send 'press N', 'release N', 'state HEX', 'reset')")
     print(f"[+] Check: ls /sys/bus/hid/devices/  |  python3 tests/test_enumerate.py")
     print(f"[+] Ctrl-C to destroy and exit\n")
 
@@ -244,26 +348,45 @@ def main() -> int:
 
     try:
         while not stop:
-            r, _, _ = select.select([fd], [], [], 1.0)
-            if fd not in r:
-                continue
-            data = os.read(fd, EVENT_SIZE)
-            if len(data) < 4:
-                continue
-            type_id = struct.unpack_from("<I", data, 0)[0]
-            name = event_name(type_id)
-            if type_id not in (UHID_OUTPUT,):
-                print(f"[<] {name}")
+            r, _, _ = select.select([fd, ctrl.fileno()], [], [], 1.0)
+            if ctrl.fileno() in r:
+                try:
+                    data, addr = ctrl.recvfrom(4096)
+                    line = data.decode("utf-8", "replace")
+                    reply = handle_ctrl_command(fd, line)
+                    print(f"[ctrl] {line.strip()!r} -> {reply.strip()}")
+                    if addr:
+                        try:
+                            ctrl.sendto(reply.encode(), addr)
+                        except OSError:
+                            pass
+                except (BlockingIOError, ConnectionResetError):
+                    pass
+            if fd in r:
+                data = os.read(fd, EVENT_SIZE)
+                if len(data) < 4:
+                    continue
+                type_id = struct.unpack_from("<I", data, 0)[0]
+                if type_id not in (UHID_OUTPUT,):
+                    print(f"[<] {event_name(type_id)}")
 
-            if type_id == UHID_GET_REPORT:
-                handle_get_report(fd, data)
-            elif type_id == UHID_SET_REPORT:
-                handle_set_report(fd, data)
-            elif type_id == UHID_OUTPUT:
-                handle_output(data)
+                if type_id == UHID_GET_REPORT:
+                    handle_get_report(fd, data)
+                elif type_id == UHID_SET_REPORT:
+                    handle_set_report(fd, data)
+                elif type_id == UHID_OUTPUT:
+                    handle_output(data)
     except KeyboardInterrupt:
         print("\n[+] Ctrl-C — destroying virtual device...")
     finally:
+        try:
+            ctrl.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(CTRL_SOCKET_PATH)
+        except OSError:
+            pass
         try:
             write_event(fd, UHID_DESTROY)
         except OSError:

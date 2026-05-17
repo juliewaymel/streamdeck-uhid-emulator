@@ -16,7 +16,7 @@ can talk to a virtual device — no Elgato hardware required.
 |------:|------|--------|
 | 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | ✅ done |
 | 2 | `python-elgato-streamdeck` enumerates it + reads firmware/serial | ✅ done |
-| 3 | Button reports (touch → HID input) | todo |
+| 3 | Button reports (UHID_INPUT2) deliver key callbacks in the app | ✅ done |
 | 4 | Image writes intercepted and rendered (pygame) | todo |
 | 5 | StreamController launches against the virtual deck | todo |
 
