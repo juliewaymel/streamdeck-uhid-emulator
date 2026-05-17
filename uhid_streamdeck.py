@@ -38,9 +38,10 @@ UHID_SET_REPORT_REPLY = 14
 
 BUS_USB = 0x03
 
-# Elgato Stream Deck MK.2: 15 buttons (5x3), 72x72 px tiles, JPEG-encoded
+# Elgato Stream Deck XL: 32 buttons (8x4), 96x96 px tiles, JPEG-encoded.
+# python-elgato-streamdeck StreamDeckXL: PID 0x006c, KEY_COUNT=32.
 VID_ELGATO         = 0x0fd9
-PID_STREAMDECK_MK2 = 0x0080
+PID_STREAMDECK_MK2 = 0x006c   # name kept for back-compat; now XL
 
 # python-elgato-streamdeck reads:
 #   - feature 0x05, 32 bytes  -> firmware version (data[6:] is ASCII)
@@ -62,7 +63,7 @@ UHID_DATA_MAX = 4096
 #   wire bytes 0..3  = report id (0x01) + 3 bytes padding/header
 #   wire bytes 4..18 = 1 byte per key (0=released, 1=pressed)
 # Total 19 bytes, including the report id prefix.
-KEY_COUNT = 15
+KEY_COUNT = 32                        # Stream Deck XL geometry: 8 cols x 4 rows
 INPUT_PAD_BYTES = 3                   # bytes between report id and key states
 INPUT_REPORT_SIZE_NOID = INPUT_PAD_BYTES + KEY_COUNT  # bytes we send via UHID_INPUT2
 
@@ -127,7 +128,7 @@ def _pad(b: bytes, n: int) -> bytes:
 
 def create2_payload() -> bytes:
     """Pack a uhid_create2_req struct."""
-    name = _pad(b"Elgato Stream Deck Virtual MK.2", 128)
+    name = _pad(b"Elgato Stream Deck XL", 128)
     phys = _pad(b"uhid-virtual-streamdeck", 64)
     uniq = _pad(SERIAL_STRING, 64)
     rd_data = _pad(HID_DESCRIPTOR, UHID_DATA_MAX)

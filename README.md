@@ -17,8 +17,13 @@ can talk to a virtual device — no Elgato hardware required.
 | 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | ✅ done |
 | 2 | `python-elgato-streamdeck` enumerates it + reads firmware/serial | ✅ done |
 | 3 | Button reports (UHID_INPUT2) deliver key callbacks in the app | ✅ done |
-| 4 | Image OUTPUT chunks reassembled and rendered on HDMI via pygame | ✅ done |
-| 5 | Touch (`/dev/hidraw0`) → press socket → StreamController launches | todo |
+| 4 | Image OUTPUT chunks reassembled and rendered on HDMI (fb0) | ✅ done |
+| 5 | Touch (`/dev/input/event0`) → press socket → key callback | ✅ done |
+
+The virtual device announces itself as a **Stream Deck XL** (PID `0x006c`,
+32 keys arranged 8 × 4, 96 × 96 px JPEG tiles, `KEY_FLIP=(True, True)`).
+Wire-level identical to the layout `python-elgato-streamdeck`'s
+`StreamDeckXL` class expects — see `Stream Deck XL` reference table below.
 
 Validated 2026-05-17 on a Raspberry Pi 4B (1GB, Pi OS 13 Trixie):
 
@@ -30,6 +35,68 @@ open() OK, is_open: True, connected: True
 firmware: '1.00.000'
 serial:   'VSD-MK2-0001'
 ```
+
+## Stream Deck XL reference (what we emulate)
+
+Sourced from `python-elgato-streamdeck/src/StreamDeck/Devices/StreamDeckXL.py`.
+
+| Field                       | Value                                |
+|-----------------------------|--------------------------------------|
+| `VENDOR_ID`                 | `0x0FD9` (Elgato)                    |
+| `PRODUCT_ID`                | `0x006C`                             |
+| `DECK_TYPE`                 | `"Stream Deck XL"`                   |
+| `KEY_COUNT`                 | 32                                   |
+| `KEY_COLS × KEY_ROWS`       | 8 × 4                                |
+| `KEY_PIXEL_WIDTH × HEIGHT`  | 96 × 96                              |
+| `KEY_IMAGE_FORMAT`          | JPEG                                 |
+| `KEY_FLIP`                  | `(True, True)` — flip H + V          |
+| `KEY_ROTATION`              | 0                                    |
+| `IMAGE_REPORT_LENGTH`       | 1024 bytes per OUTPUT chunk          |
+| `IMAGE_REPORT_HEADER_LENGTH`| 8 bytes (cmd, key, last, len, page)  |
+
+### Input report (button states)
+
+`device.read(4 + 32)` returns 36 bytes:
+
+```
+byte  0   : report id 0x01
+bytes 1-3 : constant padding (we always send 0x00)
+bytes 4-35: one byte per key, 0 = released, 1 = pressed
+```
+
+`uhid_streamdeck.py` declares the descriptor exactly this way and emits a
+`UHID_INPUT2` event with these 36 bytes every time `_key_state` changes.
+
+### Output report (image upload)
+
+The host emits `IMAGE_REPORT_LENGTH = 1024`-byte writes with this header:
+
+```
+byte 0      : report id 0x02
+byte 1      : command 0x07 (set key image)
+byte 2      : key index (0..31)
+byte 3      : is_last (1 on final chunk, else 0)
+bytes 4-5   : this chunk payload length (LE uint16)
+bytes 6-7   : page / sequence number (LE uint16, 0-based)
+bytes 8-1023: up to 1016 bytes of JPEG
+```
+
+We reassemble per key, save as `/tmp/streamdeck-keys/key-NN.jpg`, and
+notify `renderer_fb.py` to repaint that tile.
+
+### Feature reports (control)
+
+Reads:
+- **`0x05`** — firmware version: 32 bytes returned, `data[6:]` is the
+  ASCII firmware string. We answer `"1.00.000"`.
+- **`0x06`** — serial number: 32 bytes returned, `data[2:]` is the ASCII
+  serial. We answer `"VSD-MK2-0001"`.
+
+Writes:
+- **`0x03`** — control surface. Two known commands on XL:
+  - `[0x03, 0x02, …]` = reset (clear all keys)
+  - `[0x03, 0x08, percent, …]` = set brightness 0..100
+  We currently `UHID_SET_REPORT_REPLY`-ack them without acting.
 
 ## How it works
 
