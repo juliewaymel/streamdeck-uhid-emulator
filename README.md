@@ -19,6 +19,7 @@ can talk to a virtual device — no Elgato hardware required.
 | 3 | Button reports (UHID_INPUT2) deliver key callbacks in the app | ✅ done |
 | 4 | Image OUTPUT chunks reassembled and rendered on HDMI (fb0) | ✅ done |
 | 5 | Touch (`/dev/input/event0`) → press socket → key callback | ✅ done |
+| 6 | `streamdeck-ui` runs headless and drives the virtual deck end-to-end | ✅ done |
 
 The virtual device announces itself as a **Stream Deck XL** (PID `0x006c`,
 32 keys arranged 8 × 4, 96 × 96 px JPEG tiles, `KEY_FLIP=(True, True)`).
@@ -35,6 +36,51 @@ open() OK, is_open: True, connected: True
 firmware: '1.00.000'
 serial:   'VSD-MK2-0001'
 ```
+
+## Running streamdeck-ui against the virtual deck
+
+`streamdeck-ui` (Debian package `streamdeck-ui`, upstream
+`streamdeck-linux-gui/streamdeck-linux-gui`) is a PySide6 GUI that talks
+to real Stream Decks. To make it find our `/dev/uhid` device:
+
+1. Install:
+   ```bash
+   sudo apt install -y streamdeck-ui xvfb \
+       python3-pyside6.qtwidgets python3-pyside6.qtsvg \
+       python3-pil python3-hid
+   ```
+2. Use a venv with `--system-site-packages` so `streamdeck-ui` is
+   visible, then install our own `hid` wheel on top (the apt
+   `python3-hid` is built against libusb-hidapi and is blind to uhid):
+   ```bash
+   python3 -m venv --system-site-packages ~/sdvenv
+   ~/sdvenv/bin/pip install --force-reinstall --no-deps streamdeck hid
+   ```
+3. Drop a udev rule so `/dev/hidraw*` with VID 0x0FD9 is accessible:
+   ```
+   # /etc/udev/rules.d/99-streamdeck-virtual.rules
+   KERNEL=="hidraw*", ATTRS{idVendor}=="0fd9", MODE="0660", GROUP="input", TAG+="uaccess"
+   ```
+4. Launch via `streamdeck-launcher.py` under Xvfb:
+   ```bash
+   sudo systemd-run --unit=streamdeck-ui \
+       xvfb-run -a ~/sdvenv/bin/python ./streamdeck-launcher.py
+   ```
+
+`streamdeck-launcher.py` registers the `hidapi` backend and patches
+`DeviceManager.__init__` so the default transport becomes `hidapi`
+instead of `libusb` — that is the one-line change needed to make
+`stream_deck_monitor.py`'s `DeviceManager.DeviceManager().enumerate()`
+return our virtual XL.
+
+### Configuring without a display
+
+Xvfb hides the GUI; for real configuration either:
+- `ssh -X juliewwlr@<rpi> 'DISPLAY=:0 ~/sdvenv/bin/python ./streamdeck-launcher.py'`
+  forwards the GUI to an X server on the client (Linux/macOS host, or
+  VcXsrv on Windows), or
+- edit `~/.streamdeck_ui.json` directly — the file appears the first
+  time streamdeck-ui sees the deck.
 
 ## Stream Deck XL reference (what we emulate)
 
