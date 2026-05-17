@@ -14,8 +14,8 @@ can talk to a virtual device — no Elgato hardware required.
 
 | Phase | What | Status |
 |------:|------|--------|
-| 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | in progress |
-| 2 | `python-elgato-streamdeck` enumerates it | todo |
+| 1 | Virtual HID device shows up in `/sys/bus/hid/devices/` | code ready, awaiting test |
+| 2 | `python-elgato-streamdeck` enumerates it (+ firmware/serial replies) | code ready, awaiting test |
 | 3 | Button reports (touch → HID input) | todo |
 | 4 | Image writes intercepted and rendered (pygame) | todo |
 | 5 | StreamController launches against the virtual deck | todo |
@@ -46,10 +46,26 @@ In another shell, verify it shows up:
 ```bash
 ls /sys/bus/hid/devices/                      # new entry with 0FD9:0080
 cat /proc/bus/input/devices | grep -i elgato
+```
 
-# If python-elgato-streamdeck is installed:
-python3 -c "from StreamDeck.DeviceManager import DeviceManager; \
-            print([d.deck_type() for d in DeviceManager().enumerate()])"
+Then run the Phase 2 enumeration test:
+
+```bash
+pip install streamdeck
+python3 tests/test_enumerate.py
+```
+
+Expected output:
+
+```
+[+] 1 deck(s) found
+--- deck 0 ---
+  type            : Stream Deck Mk.2
+  vendor:product  : 0x0fd9:0x0080
+  key count       : 15
+  key layout      : (3, 5)
+  firmware        : '1.00.000'
+  serial          : 'VSD-MK2-0001'
 ```
 
 ## Caveats
